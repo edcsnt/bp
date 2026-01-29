@@ -1,372 +1,651 @@
 /* Copyright 2026 edcsnt. All rights reserved. */
-/* ssltrace-ebpf - eBPF SSL capture with HTTP/2 decoding (C89) */
+/* ssltrace-ebpf - eBPF uprobe tracer with unlimited data capture (C89) */
+/*
+ * Classic BPF constants from <linux/bpf_common.h> (C89 compliant, no deps).
+ * eBPF extensions and structures defined locally to avoid <linux/bpf.h>
+ * which includes <linux/types.h> -> <asm/swab.h> with inline assembly.
+ */
 #define _POSIX_C_SOURCE 199309L
-#include <stdio.h>
+#include <linux/bpf_common.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <time.h>
-#include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <linux/bpf.h>
+#include <time.h>
+#include <unistd.h>
 
-/* syscall is POSIX but needs explicit declaration for strict C89 */
-long syscall(long, ...);
+long syscall(long n, ...);
 
-#define PAGE_SIZE 4096
-#define BUFLEN 504
-#define MAX_CPUS 8
+/*
+ * eBPF extensions - linux/bpf.h (not in bpf_common.h)
+ */
+#define BPF_ALU64 0x07U
+#define BPF_DW    0x18U
+#define BPF_MOV   0xb0U
+#define BPF_JLT   0xa0U
+#define BPF_JLE   0xb0U
+#define BPF_CALL  0x80U
+#define BPF_EXIT  0x90U
 
-#ifndef __NR_bpf
-#define __NR_bpf 280
+/* BPF src_reg value for LD_IMM64 to indicate map fd */
+#define BPF_PSEUDO_MAP_FD 1U
+
+/*
+ * BPF commands - linux/bpf.h
+ */
+#define BPF_MAP_CREATE       0
+#define BPF_MAP_UPDATE_ELEM  2
+#define BPF_PROG_LOAD        5
+
+/*
+ * BPF map types - linux/bpf.h
+ */
+#define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4U
+#define BPF_MAP_TYPE_PERCPU_ARRAY     6U
+
+/*
+ * BPF program types - linux/bpf.h
+ */
+#define BPF_PROG_TYPE_KPROBE 2U
+
+/*
+ * BPF helper function IDs - linux/bpf.h
+ */
+#define BPF_FUNC_map_lookup_elem     1
+#define BPF_FUNC_get_current_pid_tgid 14
+#define BPF_FUNC_perf_event_output   25
+#define BPF_FUNC_probe_read_user     112
+
+/*
+ * BPF instruction structure - linux/bpf.h
+ * Uses unsigned int for bitfields (C89 compliant).
+ * dst_reg is lower 4 bits, src_reg is upper 4 bits on little-endian.
+ */
+struct bpf_insn {
+	unsigned char code;
+	unsigned int dst_reg:4;
+	unsigned int src_reg:4;
+	short off;
+	int imm;
+};
+
+/*
+ * BPF syscall attribute union - linux/bpf.h
+ * Only fields we use are defined; padded to correct offsets.
+ */
+union bpf_attr {
+	/* BPF_MAP_CREATE */
+	struct bpf_attr_map {
+		unsigned int map_type;
+		unsigned int key_size;
+		unsigned int value_size;
+		unsigned int max_entries;
+	} map;
+	/* BPF_PROG_LOAD */
+	struct bpf_attr_prog {
+		unsigned int prog_type;
+		unsigned int insn_cnt;
+		unsigned long insns;
+		unsigned long license;
+		unsigned int log_level;
+		unsigned int log_size;
+		unsigned long log_buf;
+	} prog;
+	/* BPF_MAP_UPDATE_ELEM */
+	struct bpf_attr_map_update {
+		unsigned int map_fd;
+		unsigned long key;
+		unsigned long value;
+	} map_update;
+};
+
+/*
+ * Perf event constants - linux/perf_event.h
+ */
+#define PERF_TYPE_SOFTWARE       1U
+#define PERF_COUNT_SW_BPF_OUTPUT 10UL
+#define PERF_SAMPLE_RAW          (1U << 10)
+#define PERF_RECORD_SAMPLE       9U
+#define PERF_FLAG_FD_CLOEXEC     (1UL << 3)
+
+/* Perf ioctl commands - computed from _IO/_IOW macros */
+#define PERF_EVENT_IOC_ENABLE   0x2400U
+#define PERF_EVENT_IOC_SET_BPF  0x40042408U
+
+/*
+ * Perf event attribute structure - linux/perf_event.h
+ */
+struct perf_event_attr {
+	unsigned int type;
+	unsigned int size;
+	unsigned long config;
+	unsigned long sample_period;
+	unsigned long sample_type;
+	unsigned long read_format;
+	unsigned long flags;
+	unsigned int wakeup_events;
+	unsigned int bp_type;
+	unsigned long config1;
+	unsigned long config2;
+	unsigned long branch_sample_type;
+	unsigned long sample_regs_user;
+	unsigned int sample_stack_user;
+	int clockid;
+	unsigned long sample_regs_intr;
+	unsigned int aux_watermark;
+	unsigned short sample_max_stack;
+	unsigned short reserved_2;
+	unsigned int aux_sample_size;
+	unsigned int reserved_3;
+	unsigned long sig_data;
+	unsigned long config3;
+};
+
+/*
+ * Perf mmap page header - linux/perf_event.h
+ * Simplified: only fields we need, with padding to correct offsets.
+ * data_head is at offset 0x68 (104 bytes) from start.
+ */
+struct perf_event_mmap_page {
+	unsigned char reserved1[104U];
+	unsigned long data_head;
+	unsigned long data_tail;
+};
+
+/*
+ * Perf event header - linux/perf_event.h
+ */
+struct perf_event_header {
+	unsigned int type;
+	unsigned short misc;
+	unsigned short size;
+};
+
+/*
+ * Application constants
+ */
+#define MAX_CPUS 1024U
+
+/* linux/bpf.h:2149 - maximum iterations for bounded loops (not exported) */
+#define BPF_MAX_LOOPS (8U * 1024U * 1024U)
+
+/* linux/percpu.h:24 - PCPU_MIN_UNIT_SIZE, max per-CPU map value */
+#define CHUNK_SIZE 32768U
+
+/*
+ * BPF instruction macros - C89 compatible (kernel uses C99 designated init)
+ */
+#define I(c,d,s,o,i) {(c),(d),(s),(o),(i)}
+#define ALU_I(op,d,i)  I(BPF_ALU64|(op)|BPF_K, (d), 0, 0, (i))
+#define ALU_R(op,d,s)  I(BPF_ALU64|(op)|BPF_X, (d), (s), 0, 0)
+#define MOV_R(d,s)     I(BPF_ALU64|BPF_MOV|BPF_X, (d), (s), 0, 0)
+#define MOV_I(d,i)     I(BPF_ALU64|BPF_MOV|BPF_K, (d), 0, 0, (i))
+#define LDX(sz,d,s,o)  I(BPF_LDX|(sz)|BPF_MEM, (d), (s), (o), 0)
+#define STX(sz,d,s,o)  I(BPF_STX|(sz)|BPF_MEM, (d), (s), (o), 0)
+#define ST(sz,d,o,i)   I(BPF_ST|(sz)|BPF_MEM, (d), 0, (o), (i))
+#define JMP(op,d,i,o)  I(BPF_JMP|(op)|BPF_K, (d), 0, (o), (i))
+#define CALL(id)       I(BPF_JMP|BPF_CALL, 0, 0, 0, (id))
+#define EXIT           I(BPF_JMP|BPF_EXIT, 0, 0, 0, 0)
+#define LD_IMM64(d,s,i) I(BPF_LD|BPF_DW|BPF_IMM, (d), (s), 0, (i)), I(0, 0, 0, 0, 0)
+#define LD_MAP(d,fd)   LD_IMM64((d), BPF_PSEUDO_MAP_FD, (fd))
+
+/*
+ * Architecture-specific pt_regs offsets for function arguments.
+ * arg2 = 2nd parameter (buffer pointer), arg3 = 3rd parameter (length).
+ * Offsets derived from arch/{ARCH}/include/asm/ptrace.h in Linux kernel.
+ */
+#if defined(__x86_64__)
+#define PT_ARG2_OFF 104
+#define PT_ARG3_OFF 96
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__aarch64__)
+#define PT_ARG2_OFF 8
+#define PT_ARG3_OFF 16
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__riscv) && __riscv_xlen == 64
+#define PT_ARG2_OFF 88
+#define PT_ARG3_OFF 96
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__mips__) && _MIPS_SIM == _ABI64
+#define PT_ARG2_OFF 40
+#define PT_ARG3_OFF 48
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__powerpc64__)
+#define PT_ARG2_OFF 32
+#define PT_ARG3_OFF 40
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__s390x__)
+#define PT_ARG2_OFF 48
+#define PT_ARG3_OFF 56
+#define PT_ARG_SIZE BPF_DW
+#elif defined(__arm__)
+#define PT_ARG2_OFF 4
+#define PT_ARG3_OFF 8
+#define PT_ARG_SIZE BPF_W
+#elif defined(__i386__)
+#define PT_ARG2_OFF 4
+#define PT_ARG3_OFF 8
+#define PT_ARG_SIZE BPF_W
+#elif defined(__riscv) && __riscv_xlen == 32
+#define PT_ARG2_OFF 44
+#define PT_ARG3_OFF 48
+#define PT_ARG_SIZE BPF_W
+#elif defined(__mips__) && _MIPS_SIM == _ABIO32
+#define PT_ARG2_OFF 52
+#define PT_ARG3_OFF 56
+#define PT_ARG_SIZE BPF_W
+#elif defined(__powerpc__) && !defined(__powerpc64__)
+#define PT_ARG2_OFF 16
+#define PT_ARG3_OFF 20
+#define PT_ARG_SIZE BPF_W
+#else
+#error "Unsupported architecture"
 #endif
-#ifndef __NR_perf_event_open
-#define __NR_perf_event_open 241
-#endif
 
-/* === HTTP/2 HPACK decoder (RFC 7541) === */
+/* Event structure size: pid(4) + len(4) + data */
+#define EVENT_SIZE (8U + CHUNK_SIZE)
 
-/* Huffman table: 256 symbols, codes 5-30 bits (RFC 7541 Appendix B) */
-static const unsigned char huff_len[257] = {
-	13,23,28,28,28,28,28,28,28,24,30,28,28,30,28,28,28,28,28,28,
-	28,28,30,28,28,28,28,28,28,28,28,28,6,10,10,12,13,6,8,11,10,
-	10,8,11,8,6,6,6,5,5,5,6,6,6,6,6,6,6,7,8,15,6,12,10,13,6,7,7,
-	7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,8,7,8,13,19,13,14,6,
-	15,5,6,5,6,5,6,6,6,5,7,7,6,6,6,5,6,7,6,5,5,6,7,7,7,7,7,15,11,
-	14,13,28,20,22,20,20,22,22,22,23,22,23,23,23,23,23,24,23,24,
-	24,22,23,24,23,23,23,23,21,22,23,22,23,23,24,22,21,20,22,22,
-	23,23,21,23,22,22,24,21,22,23,23,21,21,22,21,23,22,23,23,20,
-	22,22,22,23,22,22,23,26,26,20,19,22,23,23,23,23,22,23,26,23,
-	23,23,23,23,23,26,27,27,27,27,27,26,27,27,26,26,26,27,27,27,
-	27,27,28,27,27,27,27,27,26,27,27,27,27,27,27,27,27,27,27,27,
-	27,27,27,27,27,27,28,30
-};
-static const unsigned long huff_code[257] = {
-	0x1ff8,0x7fffd8,0xfffffe2,0xfffffe3,0xfffffe4,0xfffffe5,0xfffffe6,
-	0xfffffe7,0xfffffe8,0xffffea,0x3ffffffc,0xfffffe9,0xfffffea,
-	0x3ffffffd,0xfffffeb,0xfffffec,0xfffffed,0xfffffee,0xfffffef,
-	0xffffff0,0xffffff1,0xffffff2,0x3ffffffe,0xffffff3,0xffffff4,
-	0xffffff5,0xffffff6,0xffffff7,0xffffff8,0xffffff9,0xffffffa,
-	0xffffffb,0x14,0x3f8,0x3f9,0xffa,0x1ff9,0x15,0xf8,0x7fa,0x3fa,
-	0x3fb,0xf9,0x7fb,0xfa,0x16,0x17,0x18,0x0,0x1,0x2,0x19,0x1a,0x1b,
-	0x1c,0x1d,0x1e,0x1f,0x5c,0xfb,0x7ffc,0x20,0xffb,0x3fc,0x1ffa,
-	0x21,0x5d,0x5e,0x5f,0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,
-	0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,0x71,0x72,0xfc,
-	0x73,0xfd,0x1ffb,0x7fff0,0x1ffc,0x3ffc,0x22,0x7ffd,0x3,0x23,
-	0x4,0x24,0x5,0x25,0x26,0x27,0x6,0x74,0x75,0x28,0x29,0x2a,0x7,
-	0x2b,0x76,0x2c,0x8,0x9,0x2d,0x77,0x78,0x79,0x7a,0x7b,0x7ffe,
-	0x7fc,0x3ffd,0x1ffd,0xffffffc,0xfffe6,0x3fffd2,0xfffe7,0xfffe8,
-	0x3fffd3,0x3fffd4,0x3fffd5,0x7fffd9,0x3fffd6,0x7fffda,0x7fffdb,
-	0x7fffdc,0x7fffdd,0x7fffde,0xffffeb,0x7fffdf,0xffffec,0xffffed,
-	0x3fffd7,0x7fffe0,0xffffee,0x7fffe1,0x7fffe2,0x7fffe3,0x7fffe4,
-	0x1fffdc,0x3fffd8,0x7fffe5,0x3fffd9,0x7fffe6,0x7fffe7,0xffffef,
-	0x3fffda,0x1fffdd,0xfffe9,0x3fffdb,0x3fffdc,0x7fffe8,0x7fffe9,
-	0x1fffde,0x7fffea,0x3fffdd,0x3fffde,0xfffff0,0x1fffdf,0x3fffdf,
-	0x7fffeb,0x7fffec,0x1fffe0,0x1fffe1,0x3fffe0,0x1fffe2,0x7fffed,
-	0x3fffe1,0x7fffee,0x7fffef,0xfffea,0x3fffe2,0x3fffe3,0x3fffe4,
-	0x7ffff0,0x3fffe5,0x3fffe6,0x7ffff1,0x3ffffe0,0x3ffffe1,0xfffeb,
-	0x7fff1,0x3fffe7,0x7ffff2,0x3fffe8,0x1ffffec,0x3ffffe2,0x3ffffe3,
-	0x3ffffe4,0x7ffffde,0x7ffffdf,0x3ffffe5,0xfffff1,0x1ffffed,0x7fff2,
-	0x1fffe3,0x3ffffe6,0x7ffffe0,0x7ffffe1,0x3ffffe7,0x7ffffe2,
-	0xfffff2,0x1fffe4,0x1fffe5,0x3ffffe8,0x3ffffe9,0xffffffd,
-	0x7ffffe3,0x7ffffe4,0x7ffffe5,0xfffec,0xfffff3,0xfffed,0x1fffe6,
-	0x3fffe9,0x1fffe7,0x1fffe8,0x7ffff3,0x3fffea,0x3fffeb,0x1ffffee,
-	0x1ffffef,0xfffff4,0xfffff5,0x3ffffea,0x7ffff4,0x3ffffeb,0x7ffffe6,
-	0x3ffffec,0x3ffffed,0x7ffffe7,0x7ffffe8,0x7ffffe9,0x7ffffea,
-	0x7ffffeb,0xffffffe,0x7ffffec,0x7ffffed,0x7ffffee,0x7ffffef,
-	0x7fffff0,0x3ffffee,0x3fffffff
-};
-
-static void huff_dec(const unsigned char *in, int n) {
-	unsigned long bits = 0;
-	int nb = 0, i, j;
-	for (i = 0; i < n; i++) {
-		bits = (bits << 8) | in[i];
-		nb += 8;
-		while (nb >= 5) {
-			for (j = 0; j < 256; j++) {
-				if (huff_len[j] <= (unsigned)nb) {
-					unsigned long mask = (1UL << huff_len[j]) - 1;
-					if (((bits >> (nb - huff_len[j])) & mask) == huff_code[j]) {
-						putchar(j);
-						nb -= huff_len[j];
-						bits &= (1UL << nb) - 1;
-						goto next;
-					}
-				}
-			}
-			break;
-			next:;
-		}
-	}
-}
-
-/* HPACK static table (indices 1-61) */
-static const char *hpack_n[] = {
-	"",":authority",":method",":method",":path",":path",":scheme",":scheme",
-	":status",":status",":status",":status",":status",":status",":status",
-	"accept-charset","accept-encoding","accept-language","accept-ranges",
-	"accept","access-control-allow-origin","age","allow","authorization",
-	"cache-control","content-disposition","content-encoding","content-language",
-	"content-length","content-location","content-range","content-type","cookie",
-	"date","etag","expect","expires","from","host","if-match","if-modified-since",
-	"if-none-match","if-range","if-unmodified-since","last-modified","link",
-	"location","max-forwards","proxy-authenticate","proxy-authorization","range",
-	"referer","refresh","retry-after","server","set-cookie",
-	"strict-transport-security","transfer-encoding","user-agent","vary","via",
-	"www-authenticate"
-};
-static const char *hpack_v[] = {
-	"","","GET","POST","/","/index.html","http","https","200","204","206",
-	"304","400","404","500","","gzip, deflate","","","","","","","","","",
-	"","","","","","","","","","","","","","","","","","","","","","","",
-	"","","","","","","","","","","","",""
-};
-
-static int dec_int(const unsigned char *b, int len, int *p, int n) {
-	int m = (1 << n) - 1, v = b[*p] & m, s = 0;
-	(*p)++;
-	if (v < m) return v;
-	while (*p < len && (b[*p] & 128)) { v += (b[(*p)++] & 127) << s; s += 7; }
-	if (*p < len) v += (b[(*p)++] & 127) << s;
-	return v;
-}
-
-static void dec_str(const unsigned char *b, int len, int *p) {
-	int h, slen;
-	if (*p >= len) return;
-	h = b[*p] & 0x80;
-	slen = dec_int(b, len, p, 7);
-	if (slen > len - *p) slen = len - *p;
-	if (h) { huff_dec(b + *p, slen); *p += slen; }
-	else while (slen-- > 0 && *p < len) putchar(b[(*p)++]);
-}
-
-static void dec_hdr(const unsigned char *b, int len) {
-	int p = 0, i;
-	unsigned char c;
-	while (p < len) {
-		c = b[p];
-		if (c & 0x80) {
-			i = dec_int(b, len, &p, 7);
-			if (i > 0 && i < 62) printf("%s: %s\n", hpack_n[i], hpack_v[i]);
-		} else if (c & 0x40) {
-			i = dec_int(b, len, &p, 6);
-			if (i > 0 && i < 62) printf("%s: ", hpack_n[i]);
-			else { dec_str(b, len, &p); printf(": "); }
-			dec_str(b, len, &p); putchar('\n');
-		} else if ((c & 0xf0) == 0 || (c & 0xf0) == 0x10) {
-			i = dec_int(b, len, &p, 4);
-			if (i > 0 && i < 62) printf("%s: ", hpack_n[i]);
-			else { dec_str(b, len, &p); printf(": "); }
-			dec_str(b, len, &p); putchar('\n');
-		} else if (c & 0x20) {
-			dec_int(b, len, &p, 5);
-		} else p++;
-	}
-}
-
-/* HTTP/2 frame buffer */
-static unsigned char h2buf[65536];
-static int h2len = 0;
-
-static void h2_process(void) {
-	int flen, ftype;
-	if (h2len >= 24 && memcmp(h2buf, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
-		memmove(h2buf, h2buf + 24, h2len - 24);
-		h2len -= 24;
-	}
-	while (h2len >= 9) {
-		flen = (h2buf[0] << 16) | (h2buf[1] << 8) | h2buf[2];
-		ftype = h2buf[3];
-		if (9 + flen > h2len) break;
-		if (ftype == 1 || ftype == 9) dec_hdr(h2buf + 9, flen);
-		else if (ftype == 0) fwrite(h2buf + 9, 1, flen, stdout);
-		memmove(h2buf, h2buf + 9 + flen, h2len - 9 - flen);
-		h2len -= 9 + flen;
-	}
-}
-
-static void h2_feed(const unsigned char *d, int n) {
-	if (h2len + n > (int)sizeof(h2buf)) h2len = 0;
-	memcpy(h2buf + h2len, d, n);
-	h2len += n;
-	h2_process();
-}
-
-/* === eBPF infrastructure === */
-
-struct event { unsigned int pid, len; unsigned char data[BUFLEN]; };
-
-static volatile sig_atomic_t run = 1;
-static int map_fd = -1, prog_fd = -1, perf_fd = -1;
-static int pbuf_fd[MAX_CPUS];
-static void *pbuf[MAX_CPUS];
+static int map_fd = -1, data_map_fd = -1, prog_fd = -1, perf_fd = -1;
+static struct perf_event_mmap_page *pbuf[MAX_CPUS];
+static unsigned char wrap_buf[sizeof(struct perf_event_header) +
+                              sizeof(unsigned int) + EVENT_SIZE];
 static long page_sz;
-static int ncpus;
+static unsigned int ncpus;
 
-static void die(const char *s) { perror(s); exit(1); }
-static void onsig(int sig) { (void)sig; run = 0; }
+/*
+ * I/O helper functions - suckless style
+ * Uses POSIX write() instead of stdio (MISRA C:2012 Rule 21.6).
+ * If msg ends with ':', errno string is appended.
+ */
+static void
+write_str(const char *s)
+{
+	(void)write(STDERR_FILENO, s, strlen(s));
+}
 
-static long sys_bpf(int cmd, union bpf_attr *a, unsigned int sz) {
+static void
+die(const char *msg)
+{
+	size_t n = strlen(msg);
+	int e = errno;
+	write_str("ssltrace: ");
+	write_str(msg);
+	if (n > 0U && msg[n - 1U] == ':') {
+		write_str(" ");
+		write_str(strerror(e));
+	}
+	write_str("\n");
+}
+
+static void
+ring_copy(void *dst, const char *base, size_t off, size_t len, size_t sz)
+{
+	size_t first = sz - off;
+	if (off + len > sz) {
+		(void)memcpy(dst, base + off, first);
+		(void)memcpy((char *)dst + first, base, len - first);
+	} else {
+		(void)memcpy(dst, base + off, len);
+	}
+}
+
+static long
+sys_bpf(int cmd, union bpf_attr *a, unsigned int sz)
+{
 	return syscall(__NR_bpf, cmd, a, sz);
 }
-static long sys_perf(struct perf_event_attr *a, int pid, int cpu, int grp, unsigned long fl) {
+
+static long
+sys_perf(struct perf_event_attr *a, int pid, int cpu, int grp, unsigned long fl)
+{
 	return syscall(__NR_perf_event_open, a, pid, cpu, grp, fl);
 }
 
-static int get_uprobe_type(void) {
-	int fd, n; char buf[32];
-	fd = open("/sys/bus/event_source/devices/uprobe/type", O_RDONLY);
-	if (fd < 0) return -1;
-	n = read(fd, buf, sizeof(buf) - 1);
-	close(fd);
-	if (n <= 0) return -1;
-	buf[n] = '\0';
-	return atoi(buf);
+static int
+create_map(unsigned int type, unsigned int val_sz, unsigned int max_ent)
+{
+	union bpf_attr a;
+	(void)memset(&a, 0, sizeof(a));
+	a.map.map_type = type;
+	a.map.key_size = 4U;
+	a.map.value_size = val_sz;
+	a.map.max_entries = max_ent;
+	return (int)sys_bpf(BPF_MAP_CREATE, &a, sizeof(a));
 }
 
-static int create_map(int nc) {
+static int
+load_prog(int perf_mfd, int data_mfd)
+{
 	union bpf_attr a;
-	memset(&a, 0, sizeof(a));
-	a.map_type = BPF_MAP_TYPE_PERF_EVENT_ARRAY;
-	a.key_size = 4; a.value_size = 4; a.max_entries = nc;
-	return sys_bpf(BPF_MAP_CREATE, &a, sizeof(a));
-}
+	static char log[8192U];
 
-static int load_prog(int mfd) {
-	union bpf_attr a;
-	static char log[4096];
+	/*
+	 * BPF program with bounded loop for unlimited data capture.
+	 *
+	 * Register allocation:
+	 *   R6 = ctx (pt_regs pointer, preserved)
+	 *   R7 = total_len (remaining bytes to read)
+	 *   R8 = user_ptr (current read position)
+	 *   R9 = data buffer pointer (from map lookup)
+	 *
+	 * Stack layout:
+	 *   [R10-4]  = map key (always 0)
+	 *   [R10-8]  = PID
+	 *   [R10-16] = loop counter
+	 */
 	struct bpf_insn prog[] = {
-		{0xbf, 6, 1, 0, 0},           /* mov r6, r1 */
-		{0x85, 0, 0, 0, 14},          /* call get_current_pid_tgid */
-		{0x77, 0, 0, 0, 32},          /* rsh r0, 32 */
-		{0x63, 10, 0, -512, 0},       /* stxw [r10-512], r0 */
-		{0x79, 7, 6, 16, 0},          /* ldxdw r7, [r6+16] */
-		{0xb5, 7, 0, 1, BUFLEN},      /* jle r7, BUFLEN, +1 */
-		{0xb7, 7, 0, 0, BUFLEN},      /* mov r7, BUFLEN */
-		{0x63, 10, 7, -508, 0},       /* stxw [r10-508], r7 */
-		{0x79, 8, 6, 8, 0},           /* ldxdw r8, [r6+8] */
-		{0xbf, 1, 10, 0, 0},          /* mov r1, r10 */
-		{0x07, 1, 0, 0, -504},        /* add r1, -504 */
-		{0xbf, 2, 7, 0, 0},           /* mov r2, r7 */
-		{0xbf, 3, 8, 0, 0},           /* mov r3, r8 */
-		{0x85, 0, 0, 0, 112},         /* call probe_read_user */
-		{0xbf, 1, 6, 0, 0},           /* mov r1, r6 */
-		{0x18, 2, 1, 0, 0},           /* ld_imm64 r2, mfd (patched) */
-		{0x00, 0, 0, 0, 0},
-		{0x18, 3, 0, 0, -1},          /* ld_imm64 r3, 0xffffffff */
-		{0x00, 0, 0, 0, 0},
-		{0xbf, 4, 10, 0, 0},          /* mov r4, r10 */
-		{0x07, 4, 0, 0, -512},        /* add r4, -512 */
-		{0xb7, 5, 0, 0, 512},         /* mov r5, 512 */
-		{0x85, 0, 0, 0, 25},          /* call perf_event_output */
-		{0xb7, 0, 0, 0, 0},           /* mov r0, 0 */
-		{0x95, 0, 0, 0, 0}            /* exit */
+		/* r6=ctx, get pid, r7=len, r8=buf */
+		MOV_R(6, 1),
+		CALL(BPF_FUNC_get_current_pid_tgid),
+		ALU_I(BPF_RSH, 0, 32),
+		STX(BPF_W, 10, 0, -8),
+		LDX(PT_ARG_SIZE, 7, 6, PT_ARG3_OFF),
+		LDX(PT_ARG_SIZE, 8, 6, PT_ARG2_OFF),
+		/* r9 = map_lookup_elem(data_map, &0) */
+		ST(BPF_W, 10, -4, 0),
+		LD_MAP(1, 0),
+		MOV_R(2, 10),
+		ALU_I(BPF_ADD, 2, -4),
+		CALL(BPF_FUNC_map_lookup_elem),
+		JMP(BPF_JEQ, 0, 0, 31),
+		MOV_R(9, 0),
+		/* event->pid = pid */
+		LDX(BPF_W, 0, 10, -8),
+		STX(BPF_W, 9, 0, 0),
+		ST(BPF_DW, 10, -16, 0),
+		/* LOOP: if (r7 <= 0) exit */
+		JMP(BPF_JLE, 7, 0, 26),
+		/* r1 = min(r7, CHUNK_SIZE) */
+		MOV_R(1, 7),
+		JMP(BPF_JLE, 1, CHUNK_SIZE, 1),
+		MOV_I(1, CHUNK_SIZE),
+		STX(BPF_W, 9, 1, 4),
+		STX(BPF_DW, 10, 1, -24),
+		/* probe_read_user(event->data, chunk_len, user_ptr) */
+		MOV_R(1, 9),
+		ALU_I(BPF_ADD, 1, 8),
+		LDX(BPF_DW, 2, 10, -24),
+		MOV_R(3, 8),
+		CALL(BPF_FUNC_probe_read_user),
+		/* perf_event_output(ctx, map, -1, event, 8+len) */
+		MOV_R(1, 6),
+		LD_MAP(2, 0),
+		I(BPF_LD|BPF_DW|BPF_IMM, 3, 0, 0, -1), I(0, 0, 0, 0, -1),
+		MOV_R(4, 9),
+		LDX(BPF_DW, 5, 10, -24),
+		ALU_I(BPF_ADD, 5, 8),
+		CALL(BPF_FUNC_perf_event_output),
+		/* r8 += chunk, r7 -= chunk */
+		LDX(BPF_DW, 0, 10, -24),
+		ALU_R(BPF_ADD, 8, 0),
+		ALU_R(BPF_SUB, 7, 0),
+		/* loop counter++, continue if < max */
+		LDX(BPF_DW, 0, 10, -16),
+		ALU_I(BPF_ADD, 0, 1),
+		STX(BPF_DW, 10, 0, -16),
+		JMP(BPF_JLT, 0, BPF_MAX_LOOPS, -27),
+		/* exit */
+		MOV_I(0, 0),
+		EXIT
 	};
-	prog[15].imm = mfd;
-	memset(&a, 0, sizeof(a));
-	a.prog_type = BPF_PROG_TYPE_KPROBE;
-	a.insns = (unsigned long)prog;
-	a.insn_cnt = sizeof(prog)/sizeof(prog[0]);
-	a.license = (unsigned long)"GPL";
-	a.log_buf = (unsigned long)log; a.log_size = sizeof(log); a.log_level = 1;
-	prog_fd = sys_bpf(BPF_PROG_LOAD, &a, sizeof(a));
-	if (prog_fd < 0) fprintf(stderr, "bpf: %s\n", log);
+
+	/* Patch map file descriptors */
+	prog[7].imm = data_mfd;
+	prog[29].imm = perf_mfd;
+
+	(void)memset(&a, 0, sizeof(a));
+	a.prog.prog_type = BPF_PROG_TYPE_KPROBE;
+	a.prog.insns = (unsigned long)prog;
+	a.prog.insn_cnt = (unsigned int)(sizeof(prog) / sizeof(prog[0]));
+	a.prog.license = (unsigned long)"GPL";
+	a.prog.log_buf = (unsigned long)log;
+	a.prog.log_size = (unsigned int)sizeof(log);
+	a.prog.log_level = 1U;
+
+	prog_fd = (int)sys_bpf(BPF_PROG_LOAD, &a, sizeof(a));
+	if (prog_fd < 0) {
+		write_str("ssltrace: bpf:\n");
+		write_str(log);
+		write_str("\n");
+	}
 	return prog_fd;
 }
 
-static int attach(const char *path, unsigned long off, int pfd) {
+static int
+attach(const char *path, unsigned long off, int pfd, int target_pid)
+{
 	struct perf_event_attr a;
-	int type = get_uprobe_type(), fd;
-	if (type < 0) return -1;
-	memset(&a, 0, sizeof(a));
-	a.type = type; a.size = sizeof(a);
-	a.config1 = (unsigned long)path; a.config2 = off;
-	a.sample_period = 1; a.wakeup_events = 1;
-	fd = sys_perf(&a, -1, 0, -1, PERF_FLAG_FD_CLOEXEC);
-	if (fd < 0) return -1;
-	if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, pfd) < 0) { close(fd); return -1; }
-	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+	int fd, type, perf_pid, perf_cpu;
+	long n, val;
+	char *endp;
+	char buf[32U];
+
+	fd = open("/sys/bus/event_source/devices/uprobe/type", O_RDONLY);
+	if (fd < 0) {
+		return -1;
+	}
+	n = read(fd, buf, sizeof(buf) - 1U);
+	if (close(fd) < 0) {
+		return -1;
+	}
+	if (n <= 0L) {
+		return -1;
+	}
+	buf[(size_t)n] = '\0';
+	val = strtol(buf, &endp, 10);
+	if ((endp == buf) || (val < 0L) || (val > 2147483647L)) {
+		return -1;
+	}
+	type = (int)val;
+
+	if (target_pid < 0) {
+		perf_pid = -1;
+		perf_cpu = 0;
+	} else {
+		perf_pid = target_pid;
+		perf_cpu = -1;
+	}
+	(void)memset(&a, 0, sizeof(a));
+	a.type = (unsigned int)type;
+	a.size = (unsigned int)sizeof(a);
+	a.config1 = (unsigned long)path;
+	a.config2 = off;
+	a.sample_period = 1UL;
+	a.wakeup_events = 1U;
+	fd = (int)sys_perf(&a, perf_pid, perf_cpu, -1, PERF_FLAG_FD_CLOEXEC);
+	if (fd < 0) {
+		return -1;
+	}
+	if (ioctl(fd, (int)PERF_EVENT_IOC_SET_BPF, pfd) < 0) {
+		return -1;
+	}
+	if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+		return -1;
+	}
 	return fd;
 }
 
-static int setup_pbuf(int mfd, int cpu) {
+static int
+setup_pbuf(int mfd, int cpu)
+{
 	struct perf_event_attr a;
 	union bpf_attr ba;
 	int fd;
-	memset(&a, 0, sizeof(a));
-	a.type = PERF_TYPE_SOFTWARE; a.size = sizeof(a);
+	(void)memset(&a, 0, sizeof(a));
+	a.type = PERF_TYPE_SOFTWARE;
+	a.size = (unsigned int)sizeof(a);
 	a.config = PERF_COUNT_SW_BPF_OUTPUT;
-	a.sample_period = 1; a.sample_type = PERF_SAMPLE_RAW; a.wakeup_events = 1;
-	fd = sys_perf(&a, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-	if (fd < 0) return -1;
-	pbuf[cpu] = mmap(NULL, page_sz * 9, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-	if (pbuf[cpu] == MAP_FAILED) { close(fd); return -1; }
-	memset(&ba, 0, sizeof(ba));
-	ba.map_fd = mfd; ba.key = (unsigned long)&cpu; ba.value = (unsigned long)&fd;
-	if (sys_bpf(BPF_MAP_UPDATE_ELEM, &ba, sizeof(ba)) < 0) { close(fd); return -1; }
-	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-	pbuf_fd[cpu] = fd;
+	a.sample_period = 1UL;
+	a.sample_type = PERF_SAMPLE_RAW;
+	a.wakeup_events = 1U;
+	fd = (int)sys_perf(&a, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+	if (fd < 0) {
+		return -1;
+	}
+	pbuf[cpu] = mmap(NULL, (size_t)page_sz * 9U, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                 fd, 0);
+	if (pbuf[cpu] == MAP_FAILED) {
+		return -1;
+	}
+	(void)memset(&ba, 0, sizeof(ba));
+	ba.map_update.map_fd = (unsigned int)mfd;
+	ba.map_update.key = (unsigned long)&cpu;
+	ba.map_update.value = (unsigned long)&fd;
+	if (sys_bpf(BPF_MAP_UPDATE_ELEM, &ba, sizeof(ba)) < 0) {
+		return -1;
+	}
+	if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+		return -1;
+	}
 	return fd;
 }
 
-static void poll_cpu(int cpu) {
+static void
+poll_cpu(int cpu)
+{
 	struct perf_event_mmap_page *hdr;
 	char *base;
-	unsigned long tail, head, buf_sz, off;
-	struct perf_event_header *ev;
-	struct event *e;
-	if (!pbuf[cpu]) return;
-	hdr = pbuf[cpu];
-	base = (char *)pbuf[cpu] + page_sz;
-	buf_sz = page_sz * 8;
-	head = hdr->data_head;
-	__sync_synchronize();
-	tail = hdr->data_tail;
-	while (tail < head) {
-		off = tail % buf_sz;
-		ev = (struct perf_event_header *)(base + off);
-		if (ev->type == PERF_RECORD_SAMPLE) {
-			e = (struct event *)((char *)ev + sizeof(*ev) + sizeof(unsigned int));
-			if (e->len > 0) { h2_feed(e->data, e->len > BUFLEN ? BUFLEN : e->len); fflush(stdout); }
-		}
-		tail += ev->size;
+	unsigned long head, tail;
+	size_t buf_sz, off, data_off;
+	struct perf_event_header ev_hdr;
+	unsigned int len;
+
+	if (pbuf[cpu] == NULL) {
+		return;
 	}
-	hdr->data_tail = tail;
+	hdr = pbuf[cpu];
+	base = (char *)hdr + page_sz;
+	buf_sz = (size_t)page_sz * 8U;
+
+	head = *(volatile unsigned long *)&hdr->data_head;
+	tail = hdr->data_tail;
+
+	while (tail != head) {
+		off = tail & (buf_sz - 1U);
+		ring_copy(&ev_hdr, base, off, sizeof(ev_hdr), buf_sz);
+		ring_copy(wrap_buf, base, off, (size_t)ev_hdr.size, buf_sz);
+
+		if (ev_hdr.type == PERF_RECORD_SAMPLE) {
+			/* Offset to len: header + raw_size(u32) + pid(u32) */
+			data_off = sizeof(ev_hdr) + 2U * sizeof(unsigned int);
+			(void)memcpy(&len, wrap_buf + data_off, sizeof(len));
+			if (len > CHUNK_SIZE) {
+				len = CHUNK_SIZE;
+			}
+			if (len > 0U) {
+				/* Data starts after len field */
+				if (write(STDOUT_FILENO,
+				          wrap_buf + data_off + sizeof(unsigned int),
+				          len) < 0) {
+					/* Output write failed, continue tracing */
+				}
+			}
+		}
+		tail += ev_hdr.size;
+	}
+
+	*(volatile unsigned long *)&hdr->data_tail = tail;
 }
 
-static void poll_all(void) { int i; for (i = 0; i < ncpus; i++) poll_cpu(i); }
-
-int main(int argc, char **argv) {
-	char apk[512];
-	const char *path, *sep;
+int
+main(int argc, char **argv)
+{
+	const char *path;
 	unsigned long off;
-	int i;
+	unsigned int i;
+	int target_pid;
 	struct timespec ts;
-	size_t n;
-	if (argc != 3) { fprintf(stderr, "usage: %s apk offset\n", argv[0]); return 1; }
-	path = argv[1]; off = strtoul(argv[2], NULL, 0); page_sz = PAGE_SIZE;
-	sep = strchr(path, '!');
-	if (sep) { n = sep - path; if (n >= sizeof(apk)) n = sizeof(apk) - 1;
-		memcpy(apk, path, n); apk[n] = '\0'; path = apk; }
-	signal(SIGINT, onsig); signal(SIGTERM, onsig);
-	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (ncpus < 1) ncpus = 1;
-	if (ncpus > MAX_CPUS) ncpus = MAX_CPUS;
-	map_fd = create_map(ncpus); if (map_fd < 0) die("map");
-	prog_fd = load_prog(map_fd); if (prog_fd < 0) die("prog");
-	perf_fd = attach(path, off, prog_fd); if (perf_fd < 0) die("attach");
-	for (i = 0; i < ncpus; i++)
-		if (setup_pbuf(map_fd, i) < 0) fprintf(stderr, "warn: cpu%d\n", i);
-	fprintf(stderr, "tracing on %d CPUs...\n", ncpus);
-	ts.tv_sec = 0; ts.tv_nsec = 100000000;
-	while (run) { nanosleep(&ts, NULL); poll_all(); }
-	for (i = 0; i < ncpus; i++) if (pbuf_fd[i] > 0) close(pbuf_fd[i]);
-	close(perf_fd); close(prog_fd); close(map_fd);
-	return 0;
+	char *endp;
+
+	target_pid = -1;
+
+	/* Parse -p option */
+	if (argc >= 2 && strcmp(argv[1], "-p") == 0) {
+		long pid_val;
+		if (argc < 3) {
+			goto usage;
+		}
+		pid_val = strtol(argv[2], &endp, 10);
+		if ((endp == argv[2]) || (*endp != '\0') || (pid_val < 0L) || (pid_val > 2147483647L)) {
+			die("Invalid PID");
+			return 1;
+		}
+		target_pid = (int)pid_val;
+		argv += 2;
+		argc -= 2;
+	}
+
+	if (argc != 3) {
+usage:
+		write_str("usage: ssltrace [-p pid] file offset\n");
+		return 1;
+	}
+	path = argv[1];
+	off = strtoul(argv[2], &endp, 0);
+	if ((endp == argv[2]) || (*endp != '\0')) {
+		die("Invalid offset");
+		return 1;
+	}
+
+	page_sz = sysconf(_SC_PAGESIZE);
+	if (page_sz < 4096) {
+		page_sz = 4096;
+	}
+
+	{
+		long nc = sysconf(_SC_NPROCESSORS_ONLN);
+		if (nc < 1L) {
+			nc = 1L;
+		}
+		if (nc > (long)MAX_CPUS) {
+			nc = (long)MAX_CPUS;
+		}
+		ncpus = (unsigned int)nc;
+	}
+
+	map_fd = create_map(BPF_MAP_TYPE_PERF_EVENT_ARRAY, 4U, ncpus);
+	if (map_fd < 0) {
+		die("create perf map:");
+		return 1;
+	}
+
+	data_map_fd = create_map(BPF_MAP_TYPE_PERCPU_ARRAY, EVENT_SIZE, 1U);
+	if (data_map_fd < 0) {
+		die("create data map:");
+		return 1;
+	}
+
+	prog_fd = load_prog(map_fd, data_map_fd);
+	if (prog_fd < 0) {
+		die("load bpf:");
+		return 1;
+	}
+
+	perf_fd = attach(path, off, prog_fd, target_pid);
+	if (perf_fd < 0) {
+		int e = errno;
+		write_str("ssltrace: attach ");
+		write_str(path);
+		write_str(": ");
+		write_str(strerror(e));
+		write_str("\n");
+		return 1;
+	}
+
+	for (i = 0U; i < ncpus; i++) {
+		(void)setup_pbuf(map_fd, (int)i);
+	}
+
+	ts.tv_sec = 0;
+	ts.tv_nsec = 100000000L;
+	for (;;) {
+		(void)nanosleep(&ts, NULL);
+		for (i = 0U; i < ncpus; i++) {
+			poll_cpu((int)i);
+		}
+	}
+	/* NOTREACHED - process terminated by signal, kernel cleans up */
 }
